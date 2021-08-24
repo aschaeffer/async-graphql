@@ -45,6 +45,8 @@ where
     F: FnOnce(serde_json::Value) -> R + Unpin + Send + Sync + 'static,
     R: Future<Output = Result<Data>> + Send + 'static,
 {
+    type Output = ();
+
     async fn call(&self, req: Request) -> Response {
         todo!()
     }
