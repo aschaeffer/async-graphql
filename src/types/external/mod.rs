@@ -20,10 +20,14 @@ mod chrono_tz;
 mod datetime;
 #[cfg(feature = "decimal")]
 mod decimal;
+#[cfg(feature = "chrono-duration")]
+mod duration;
 #[cfg(feature = "chrono")]
 mod naive_time;
 #[cfg(feature = "secrecy")]
 mod secrecy;
+#[cfg(feature = "smol_str")]
+mod smol_str;
 #[cfg(feature = "url")]
 mod url;
 #[cfg(feature = "uuid")]

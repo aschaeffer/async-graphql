@@ -41,6 +41,10 @@ impl Data {
     pub fn insert<D: Any + Send + Sync>(&mut self, data: D) {
         self.0.insert(TypeId::of::<D>(), Box::new(data));
     }
+
+    pub(crate) fn merge(&mut self, other: Data) {
+        self.0.extend(other.0);
+    }
 }
 
 impl Debug for Data {
@@ -54,6 +58,9 @@ pub type ContextSelectionSet<'a> = ContextBase<'a, &'a Positioned<SelectionSet>>
 
 /// Context object for resolve field
 pub type Context<'a> = ContextBase<'a, &'a Positioned<Field>>;
+
+/// Context object for execute directive.
+pub type ContextDirective<'a> = ContextBase<'a, &'a Positioned<Directive>>;
 
 /// A segment in the path to the current query.
 ///
@@ -495,39 +502,29 @@ impl<'a, T> ContextBase<'a, T> {
     }
 
     #[doc(hidden)]
-    pub fn is_ifdef(&self, directives: &[Positioned<Directive>]) -> bool {
-        directives
+    fn get_param_value<Q: InputType>(
+        &self,
+        arguments: &[(Positioned<Name>, Positioned<InputValue>)],
+        name: &str,
+        default: Option<fn() -> Q>,
+    ) -> ServerResult<(Pos, Q)> {
+        let value = arguments
             .iter()
-            .any(|directive| directive.node.name.node == "ifdef")
-    }
-
-    #[doc(hidden)]
-    pub fn is_skip(&self, directives: &[Positioned<Directive>]) -> ServerResult<bool> {
-        for directive in directives {
-            let include = match &*directive.node.name.node {
-                "skip" => false,
-                "include" => true,
-                _ => continue,
-            };
-
-            let condition_input = directive
-                .node
-                .get_argument("if")
-                .ok_or_else(|| ServerError::new(format!(r#"Directive @{} requires argument `if` of type `Boolean!` but it was not provided."#, if include { "include" } else { "skip" }),Some(directive.pos)))?
-                .clone();
-
-            let pos = condition_input.pos;
-            let condition_input = self.resolve_input_value(condition_input)?;
-
-            if include
-                != <bool as InputType>::parse(Some(condition_input))
-                    .map_err(|e| e.into_server_error(pos))?
-            {
-                return Ok(true);
+            .find(|(n, _)| n.node.as_str() == name)
+            .map(|(_, value)| value)
+            .cloned();
+        if value.is_none() {
+            if let Some(default) = default {
+                return Ok((Pos::default(), default()));
             }
         }
-
-        Ok(false)
+        let (pos, value) = match value {
+            Some(value) => (value.pos, Some(self.resolve_input_value(value)?)),
+            None => (Pos::default(), None),
+        };
+        InputType::parse(value)
+            .map(|value| (pos, value))
+            .map_err(|e| e.into_server_error(pos))
     }
 }
 
@@ -552,18 +549,8 @@ impl<'a> ContextBase<'a, &'a Positioned<Field>> {
         &self,
         name: &str,
         default: Option<fn() -> T>,
-    ) -> ServerResult<T> {
-        let value = self.item.node.get_argument(name).cloned();
-        if value.is_none() {
-            if let Some(default) = default {
-                return Ok(default());
-            }
-        }
-        let (pos, value) = match value {
-            Some(value) => (value.pos, Some(self.resolve_input_value(value)?)),
-            None => (Pos::default(), None),
-        };
-        InputType::parse(value).map_err(|e| e.into_server_error(pos))
+    ) -> ServerResult<(Pos, T)> {
+        self.get_param_value(&self.item.node.arguments, name, default)
     }
 
     /// Creates a uniform interface to inspect the forthcoming selections.
@@ -631,12 +618,12 @@ impl<'a> ContextBase<'a, &'a Positioned<Field>> {
     ///     }
     /// }
     ///
-    /// tokio::runtime::Runtime::new().unwrap().block_on(async move {
-    ///     let schema = Schema::new(Query, EmptyMutation, EmptySubscription);
-    ///     assert!(schema.execute("{ obj { a b c }}").await.is_ok());
-    ///     assert!(schema.execute("{ obj { a ... { b c } }}").await.is_ok());
-    ///     assert!(schema.execute("{ obj { a ... BC }} fragment BC on MyObj { b c }").await.is_ok());
-    /// });
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async move {
+    /// let schema = Schema::new(Query, EmptyMutation, EmptySubscription);
+    /// assert!(schema.execute("{ obj { a b c }}").await.is_ok());
+    /// assert!(schema.execute("{ obj { a ... { b c } }}").await.is_ok());
+    /// assert!(schema.execute("{ obj { a ... BC }} fragment BC on MyObj { b c }").await.is_ok());
+    /// # });
     ///
     /// ```
     pub fn field(&self) -> SelectionField {
@@ -645,6 +632,17 @@ impl<'a> ContextBase<'a, &'a Positioned<Field>> {
             field: &self.item.node,
             context: self,
         }
+    }
+}
+
+impl<'a> ContextBase<'a, &'a Positioned<Directive>> {
+    #[doc(hidden)]
+    pub fn param_value<T: InputType>(
+        &self,
+        name: &str,
+        default: Option<fn() -> T>,
+    ) -> ServerResult<(Pos, T)> {
+        self.get_param_value(&self.item.node.arguments, name, default)
     }
 }
 
@@ -728,17 +726,6 @@ impl<'a> Iterator for SelectionFieldsIter<'a> {
         loop {
             let it = self.iter.last_mut()?;
             let item = it.next();
-            if let Some(item) = item {
-                // ignore any items that are skipped (i.e. @skip/@include)
-                if self
-                    .context
-                    .is_skip(&item.node.directives())
-                    .unwrap_or(false)
-                {
-                    // TODO: should we throw errors here? they will be caught later in execution and it'd cause major backwards compatibility issues
-                    continue;
-                }
-            }
 
             match item {
                 Some(selection) => match &selection.node {

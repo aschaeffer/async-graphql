@@ -39,6 +39,7 @@ impl Query {
     .data(env_struct)
     .data(s3_storage)
     .data(db_core)
+    .finish();
 ```
 
 ### 请求数据
@@ -84,7 +85,7 @@ impl Query {
         // If multiple headers with the same key are `inserted` then the most recent
         // one overwrites the previous. If you want multiple headers for the same key, use
         // `append_http_header` for subsequent headers
-        let was_in_headers = ctx.insert_http_header("Custom-Header", "Hello World");
+        let was_in_headers = ctx.append_http_header("Custom-Header", "Hello World");
 
         String::from("Hello world")
     }
@@ -93,7 +94,7 @@ impl Query {
 
 ## Selection / LookAhead
 
-有时你想知道子查询中请求了哪些字段用于优化数据处理，则可以使用`ctx.fields()`读取查询中的字段，它将提供一个`SelectionField`，允许你在当前字段和子字段之间导航。
+有时你想知道子查询中请求了哪些字段用于优化数据处理，则可以使用`ctx.field()`读取查询中的字段，它将提供一个`SelectionField`，允许你在当前字段和子字段之间导航。
 
 如果要跨查询或子查询执行搜索，则不必使用 `SelectionField` 手动执行此操作，可以使用 `ctx.look_ahead()` 来执行选择。
 

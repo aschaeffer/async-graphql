@@ -3,16 +3,18 @@ mod export_sdl;
 mod stringify_exec_doc;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
 
 use indexmap::map::IndexMap;
 use indexmap::set::IndexSet;
 
+pub use crate::model::__DirectiveLocation;
 use crate::parser::types::{
     BaseType as ParsedBaseType, Field, Type as ParsedType, VariableDefinition,
 };
-use crate::validators::InputValueValidator;
-use crate::{model, Any, Context, Positioned, ServerResult, Type, Value, VisitorContext};
+use crate::{
+    model, Any, Context, InputType, OutputType, Positioned, ServerResult, SubscriptionType, Value,
+    VisitorContext,
+};
 
 pub use cache_control::CacheControl;
 
@@ -106,7 +108,6 @@ pub struct MetaInputValue {
     pub description: Option<&'static str>,
     pub ty: String,
     pub default_value: Option<String>,
-    pub validator: Option<Arc<dyn InputValueValidator>>,
     pub visible: Option<MetaVisibleFn>,
     pub is_secret: bool,
 }
@@ -183,6 +184,7 @@ pub enum MetaType {
         description: Option<&'static str>,
         is_valid: fn(value: &Value) -> bool,
         visible: Option<MetaVisibleFn>,
+        specified_by_url: Option<&'static str>,
     },
     Object {
         name: String,
@@ -192,6 +194,8 @@ pub enum MetaType {
         extends: bool,
         keys: Option<Vec<String>>,
         visible: Option<MetaVisibleFn>,
+        is_subscription: bool,
+        rust_typename: &'static str,
     },
     Interface {
         name: String,
@@ -201,24 +205,28 @@ pub enum MetaType {
         extends: bool,
         keys: Option<Vec<String>>,
         visible: Option<MetaVisibleFn>,
+        rust_typename: &'static str,
     },
     Union {
         name: String,
         description: Option<&'static str>,
         possible_types: IndexSet<String>,
         visible: Option<MetaVisibleFn>,
+        rust_typename: &'static str,
     },
     Enum {
         name: String,
         description: Option<&'static str>,
         enum_values: IndexMap<&'static str, MetaEnumValue>,
         visible: Option<MetaVisibleFn>,
+        rust_typename: &'static str,
     },
     InputObject {
         name: String,
         description: Option<&'static str>,
         input_fields: IndexMap<String, MetaInputValue>,
         visible: Option<MetaVisibleFn>,
+        rust_typename: &'static str,
     },
 }
 
@@ -247,10 +255,7 @@ impl MetaType {
             MetaType::Enum { visible, .. } => visible,
             MetaType::InputObject { visible, .. } => visible,
         };
-        match visible {
-            Some(f) => f(ctx),
-            None => true,
-        }
+        is_visible(ctx, visible)
     }
 
     #[inline]
@@ -327,6 +332,17 @@ impl MetaType {
             (false, false) => false,
         }
     }
+
+    pub fn rust_typename(&self) -> Option<&'static str> {
+        match self {
+            MetaType::Scalar { .. } => None,
+            MetaType::Object { rust_typename, .. } => Some(rust_typename),
+            MetaType::Interface { rust_typename, .. } => Some(rust_typename),
+            MetaType::Union { rust_typename, .. } => Some(rust_typename),
+            MetaType::Enum { rust_typename, .. } => Some(rust_typename),
+            MetaType::InputObject { rust_typename, .. } => Some(rust_typename),
+        }
+    }
 }
 
 pub struct MetaDirective {
@@ -334,6 +350,8 @@ pub struct MetaDirective {
     pub description: Option<&'static str>,
     pub locations: Vec<model::__DirectiveLocation>,
     pub args: IndexMap<&'static str, MetaInputValue>,
+    pub is_repeatable: bool,
+    pub visible: Option<MetaVisibleFn>,
 }
 
 #[derive(Default)]
@@ -350,32 +368,89 @@ pub struct Registry {
 }
 
 impl Registry {
-    pub fn create_type<T: crate::Type + ?Sized, F: FnMut(&mut Registry) -> MetaType>(
+    pub fn create_input_type<T: InputType + ?Sized, F: FnMut(&mut Registry) -> MetaType>(
         &mut self,
         mut f: F,
     ) -> String {
-        let name = T::type_name();
-        if !self.types.contains_key(name.as_ref()) {
-            // Inserting a fake type before calling the function allows recursive types to exist.
-            self.types.insert(
-                name.clone().into_owned(),
-                MetaType::Object {
-                    name: "".to_string(),
-                    description: None,
-                    fields: Default::default(),
-                    cache_control: Default::default(),
-                    extends: false,
-                    keys: None,
-                    visible: None,
-                },
-            );
-            let ty = f(self);
-            *self.types.get_mut(&*name).unwrap() = ty;
-        }
+        self.create_type(&mut f, &*T::type_name(), std::any::type_name::<T>());
         T::qualified_type_name()
     }
 
-    pub fn create_dummy_type<T: Type>(&mut self) -> MetaType {
+    pub fn create_output_type<T: OutputType + ?Sized, F: FnMut(&mut Registry) -> MetaType>(
+        &mut self,
+        mut f: F,
+    ) -> String {
+        self.create_type(&mut f, &*T::type_name(), std::any::type_name::<T>());
+        T::qualified_type_name()
+    }
+
+    pub fn create_subscription_type<
+        T: SubscriptionType + ?Sized,
+        F: FnMut(&mut Registry) -> MetaType,
+    >(
+        &mut self,
+        mut f: F,
+    ) -> String {
+        self.create_type(&mut f, &*T::type_name(), std::any::type_name::<T>());
+        T::qualified_type_name()
+    }
+
+    fn create_type<F: FnMut(&mut Registry) -> MetaType>(
+        &mut self,
+        f: &mut F,
+        name: &str,
+        rust_typename: &str,
+    ) {
+        match self.types.get(name) {
+            Some(ty) => {
+                if let Some(prev_typename) = ty.rust_typename() {
+                    if prev_typename != "__fake_type__" && rust_typename != prev_typename {
+                        panic!(
+                            "`{}` and `{}` have the same GraphQL name `{}`",
+                            prev_typename, rust_typename, name,
+                        );
+                    }
+                }
+            }
+            None => {
+                // Inserting a fake type before calling the function allows recursive types to exist.
+                self.types.insert(
+                    name.to_string(),
+                    MetaType::Object {
+                        name: "".to_string(),
+                        description: None,
+                        fields: Default::default(),
+                        cache_control: Default::default(),
+                        extends: false,
+                        keys: None,
+                        visible: None,
+                        is_subscription: false,
+                        rust_typename: "__fake_type__",
+                    },
+                );
+                let ty = f(self);
+                *self.types.get_mut(&*name).unwrap() = ty;
+            }
+        }
+    }
+
+    pub fn create_fake_output_type<T: OutputType>(&mut self) -> MetaType {
+        T::create_type_info(self);
+        self.types
+            .get(&*T::type_name())
+            .cloned()
+            .expect("You definitely encountered a bug!")
+    }
+
+    pub fn create_fake_input_type<T: InputType>(&mut self) -> MetaType {
+        T::create_type_info(self);
+        self.types
+            .get(&*T::type_name())
+            .cloned()
+            .expect("You definitely encountered a bug!")
+    }
+
+    pub fn create_fake_subscription_type<T: SubscriptionType>(&mut self) -> MetaType {
         T::create_type_info(self);
         self.types
             .get(&*T::type_name())
@@ -438,7 +513,7 @@ impl Registry {
     }
 
     fn create_entity_type(&mut self) {
-        let possible_types = self
+        let possible_types: IndexSet<String> = self
             .types
             .values()
             .filter_map(|ty| match ty {
@@ -463,12 +538,13 @@ impl Registry {
                 description: None,
                 possible_types,
                 visible: None,
+                rust_typename: "async_graphql::federation::Entity",
             },
         );
     }
 
     pub(crate) fn create_federation_types(&mut self) {
-        Any::create_type_info(self);
+        <Any as InputType>::create_type_info(self);
 
         self.types.insert(
             "_Service".to_string(),
@@ -499,6 +575,8 @@ impl Registry {
                 extends: false,
                 keys: None,
                 visible: None,
+                is_subscription: false,
+                rust_typename: "async_graphql::federation::Service",
             },
         );
 
@@ -537,7 +615,6 @@ impl Registry {
                                 description: None,
                                 ty: "[_Any!]!".to_string(),
                                 default_value: None,
-                                validator: None,
                                 visible: None,
                                 is_secret: false,
                             },
@@ -601,8 +678,8 @@ impl Registry {
         names.into_iter().collect()
     }
 
-    pub fn set_description<T: Type>(&mut self, desc: &'static str) {
-        match self.types.get_mut(&*T::type_name()) {
+    pub fn set_description(&mut self, name: &str, desc: &'static str) {
+        match self.types.get_mut(name) {
             Some(MetaType::Scalar { description, .. }) => *description = Some(desc),
             Some(MetaType::Object { description, .. }) => *description = Some(desc),
             Some(MetaType::Interface { description, .. }) => *description = Some(desc),
@@ -688,6 +765,12 @@ impl Registry {
             }
         }
 
+        for directive in self.directives.values() {
+            for arg in directive.args.values() {
+                traverse_input_value(&self.types, &mut used_types, arg);
+            }
+        }
+
         for type_name in Some(&self.query_type)
             .into_iter()
             .chain(self.mutation_type.iter())
@@ -708,18 +791,6 @@ impl Registry {
             traverse_type(&self.types, &mut used_types, ty.name());
         }
 
-        fn is_system_type(name: &str) -> bool {
-            if name.starts_with("__") {
-                return true;
-            }
-
-            name == "Boolean"
-                || name == "Int"
-                || name == "Float"
-                || name == "String"
-                || name == "ID"
-        }
-
         for ty in self.types.values() {
             let name = ty.name();
             if !is_system_type(name) && !used_types.contains(name) {
@@ -731,4 +802,164 @@ impl Registry {
             self.types.remove(&type_name);
         }
     }
+
+    pub fn find_visible_types(&self, ctx: &Context<'_>) -> HashSet<&str> {
+        let mut visible_types = HashSet::new();
+
+        fn traverse_field<'a>(
+            ctx: &Context<'_>,
+            types: &'a BTreeMap<String, MetaType>,
+            visible_types: &mut HashSet<&'a str>,
+            field: &'a MetaField,
+        ) {
+            if !is_visible(ctx, &field.visible) {
+                return;
+            }
+
+            traverse_type(
+                ctx,
+                types,
+                visible_types,
+                MetaTypeName::concrete_typename(&field.ty),
+            );
+            for arg in field.args.values() {
+                traverse_input_value(ctx, types, visible_types, arg);
+            }
+        }
+
+        fn traverse_input_value<'a>(
+            ctx: &Context<'_>,
+            types: &'a BTreeMap<String, MetaType>,
+            visible_types: &mut HashSet<&'a str>,
+            input_value: &'a MetaInputValue,
+        ) {
+            if !is_visible(ctx, &input_value.visible) {
+                return;
+            }
+
+            traverse_type(
+                ctx,
+                types,
+                visible_types,
+                MetaTypeName::concrete_typename(&input_value.ty),
+            );
+        }
+
+        fn traverse_type<'a>(
+            ctx: &Context<'_>,
+            types: &'a BTreeMap<String, MetaType>,
+            visible_types: &mut HashSet<&'a str>,
+            type_name: &'a str,
+        ) {
+            if visible_types.contains(type_name) {
+                return;
+            }
+
+            if let Some(ty) = types.get(type_name) {
+                if !ty.is_visible(ctx) {
+                    return;
+                }
+
+                visible_types.insert(type_name);
+                match ty {
+                    MetaType::Object { fields, .. } => {
+                        for field in fields.values() {
+                            traverse_field(ctx, types, visible_types, field);
+                        }
+                    }
+                    MetaType::Interface {
+                        fields,
+                        possible_types,
+                        ..
+                    } => {
+                        for field in fields.values() {
+                            traverse_field(ctx, types, visible_types, field);
+                        }
+                        for type_name in possible_types.iter() {
+                            traverse_type(ctx, types, visible_types, type_name);
+                        }
+                    }
+                    MetaType::Union { possible_types, .. } => {
+                        for type_name in possible_types.iter() {
+                            traverse_type(ctx, types, visible_types, type_name);
+                        }
+                    }
+                    MetaType::InputObject { input_fields, .. } => {
+                        for field in input_fields.values() {
+                            traverse_input_value(ctx, types, visible_types, field);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        for directive in self.directives.values() {
+            if is_visible(ctx, &directive.visible) {
+                for arg in directive.args.values() {
+                    traverse_input_value(ctx, &self.types, &mut visible_types, arg);
+                }
+            }
+        }
+
+        for type_name in Some(&self.query_type)
+            .into_iter()
+            .chain(self.mutation_type.iter())
+            .chain(self.subscription_type.iter())
+        {
+            traverse_type(ctx, &self.types, &mut visible_types, type_name);
+        }
+
+        for ty in self.types.values().filter(|ty| match ty {
+            MetaType::Object {
+                keys: Some(keys), ..
+            }
+            | MetaType::Interface {
+                keys: Some(keys), ..
+            } => !keys.is_empty(),
+            _ => false,
+        }) {
+            traverse_type(ctx, &self.types, &mut visible_types, ty.name());
+        }
+
+        for ty in self.types.values() {
+            if let MetaType::Interface { possible_types, .. } = ty {
+                if ty.is_visible(ctx) && !visible_types.contains(ty.name()) {
+                    for type_name in possible_types.iter() {
+                        if visible_types.contains(type_name.as_str()) {
+                            traverse_type(ctx, &self.types, &mut visible_types, ty.name());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.types
+            .values()
+            .filter_map(|ty| {
+                let name = ty.name();
+                if is_system_type(name) || visible_types.contains(name) {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+pub(crate) fn is_visible(ctx: &Context<'_>, visible: &Option<MetaVisibleFn>) -> bool {
+    match visible {
+        Some(f) => f(ctx),
+        None => true,
+    }
+}
+
+fn is_system_type(name: &str) -> bool {
+    if name.starts_with("__") {
+        return true;
+    }
+
+    name == "Boolean" || name == "Int" || name == "Float" || name == "String" || name == "ID"
 }

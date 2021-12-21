@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::convert::TryFrom;
 
 use crate::parser::types::{Field, FragmentDefinition, Selection, SelectionSet};
 use crate::Context;
@@ -54,6 +53,20 @@ impl<'a> Lookahead<'a> {
     pub fn exists(&self) -> bool {
         !self.fields.is_empty()
     }
+
+    /// Get the `SelectionField`s for each of the fields covered by this `Lookahead`.
+    ///
+    /// There will be multiple fields in situations where the same field is queried twice.
+    pub fn selection_fields(&self) -> Vec<SelectionField<'a>> {
+        self.fields
+            .iter()
+            .map(|field| SelectionField {
+                fragments: self.fragments,
+                field,
+                context: self.context,
+            })
+            .collect()
+    }
 }
 
 impl<'a> From<SelectionField<'a>> for Lookahead<'a> {
@@ -97,15 +110,6 @@ fn filter<'a>(
     context: &'a Context<'a>,
 ) {
     for item in &selection_set.items {
-        // doing this imperatively is a bit nasty, but using iterators would
-        // require a boxed return type (I believe) as its recusive
-
-        // ignore any items that are skipped (i.e. @skip/@include)
-        if context.is_skip(&item.node.directives()).unwrap_or(false) {
-            // TODO: should we throw errors here? they will be caught later in execution and it'd cause major backwards compatibility issues
-            continue;
-        }
-
         match &item.node {
             Selection::Field(field) => {
                 if field.node.name.node == name {

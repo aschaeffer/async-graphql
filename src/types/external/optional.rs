@@ -3,10 +3,12 @@ use std::borrow::Cow;
 use crate::parser::types::Field;
 use crate::{
     registry, ContextSelectionSet, InputType, InputValueError, InputValueResult, OutputType,
-    Positioned, ServerResult, Type, Value,
+    Positioned, ServerResult, Value,
 };
 
-impl<T: Type> Type for Option<T> {
+impl<T: InputType> InputType for Option<T> {
+    type RawValueType = T::RawValueType;
+
     fn type_name() -> Cow<'static, str> {
         T::type_name()
     }
@@ -19,9 +21,7 @@ impl<T: Type> Type for Option<T> {
         T::create_type_info(registry);
         T::type_name().to_string()
     }
-}
 
-impl<T: InputType> InputType for Option<T> {
     fn parse(value: Option<Value>) -> InputValueResult<Self> {
         match value.unwrap_or_default() {
             Value::Null => Ok(None),
@@ -37,10 +37,30 @@ impl<T: InputType> InputType for Option<T> {
             None => Value::Null,
         }
     }
+
+    fn as_raw_value(&self) -> Option<&Self::RawValueType> {
+        match self {
+            Some(value) => value.as_raw_value(),
+            None => None,
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl<T: OutputType + Sync> OutputType for Option<T> {
+    fn type_name() -> Cow<'static, str> {
+        T::type_name()
+    }
+
+    fn qualified_type_name() -> String {
+        T::type_name().to_string()
+    }
+
+    fn create_type_info(registry: &mut registry::Registry) -> String {
+        T::create_type_info(registry);
+        T::type_name().to_string()
+    }
+
     async fn resolve(
         &self,
         ctx: &ContextSelectionSet<'_>,
@@ -62,7 +82,7 @@ impl<T: OutputType + Sync> OutputType for Option<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::Type;
+    use crate::InputType;
 
     #[test]
     fn test_optional_type() {

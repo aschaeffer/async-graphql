@@ -26,7 +26,7 @@ pub async fn test_nested_key() {
         Some("{ a b c { v } }")
     );
 
-    struct QueryRoot;
+    struct Query;
 
     #[derive(SimpleObject)]
     struct MyObj {
@@ -36,7 +36,7 @@ pub async fn test_nested_key() {
     }
 
     #[Object]
-    impl QueryRoot {
+    impl Query {
         #[graphql(entity)]
         async fn find_obj(&self, input: MyInputA) -> MyObj {
             MyObj {
@@ -47,7 +47,7 @@ pub async fn test_nested_key() {
         }
     }
 
-    let schema = Schema::new(QueryRoot, EmptyMutation, EmptySubscription);
+    let schema = Schema::new(Query, EmptyMutation, EmptySubscription);
     let query = r#"{
             _entities(representations: [{__typename: "MyObj", input: {a: 1, b: 2, c: { v: 3 }}}]) {
                 __typename
@@ -117,10 +117,10 @@ pub async fn test_federation() {
         }
     }
 
-    struct QueryRoot;
+    struct Query;
 
     #[Object]
-    impl QueryRoot {
+    impl Query {
         #[graphql(entity)]
         async fn find_user_by_id(&self, id: ID) -> User {
             User { id }
@@ -132,7 +132,7 @@ pub async fn test_federation() {
         }
     }
 
-    let schema = Schema::new(QueryRoot, EmptyMutation, EmptySubscription);
+    let schema = Schema::new(Query, EmptyMutation, EmptySubscription);
     let query = r#"{
             _entities(representations: [{__typename: "Product", upc: "B00005N5PF"}]) {
                 __typename
@@ -183,10 +183,10 @@ pub async fn test_find_entity_with_context() {
         value: i32,
     }
 
-    struct QueryRoot;
+    struct Query;
 
     #[Object]
-    impl QueryRoot {
+    impl Query {
         #[graphql(entity)]
         async fn find_user_by_id(&self, ctx: &Context<'_>, id: ID) -> FieldResult<MyObj> {
             let loader = ctx.data_unchecked::<DataLoader<MyLoader>>();
@@ -198,8 +198,8 @@ pub async fn test_find_entity_with_context() {
         }
     }
 
-    let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
-        .data(DataLoader::new(MyLoader))
+    let schema = Schema::build(Query, EmptyMutation, EmptySubscription)
+        .data(DataLoader::new(MyLoader, tokio::spawn))
         .finish();
     let query = r#"{
             _entities(representations: [
@@ -242,6 +242,7 @@ pub async fn test_find_entity_with_context() {
         schema.execute(query).await.into_result().unwrap_err(),
         vec![ServerError {
             message: "Not found".to_string(),
+            source: None,
             locations: vec![Pos {
                 line: 2,
                 column: 13
@@ -249,5 +250,38 @@ pub async fn test_find_entity_with_context() {
             path: vec![PathSegment::Field("_entities".to_owned())],
             extensions: None,
         }]
+    );
+}
+
+#[tokio::test]
+pub async fn test_entity_union() {
+    #[derive(SimpleObject)]
+    struct MyObj {
+        a: i32,
+    }
+
+    struct Query;
+
+    #[Object]
+    impl Query {
+        #[graphql(entity)]
+        async fn find_obj(&self, _id: i32) -> MyObj {
+            todo!()
+        }
+    }
+
+    let schema = Schema::new(Query, EmptyMutation, EmptySubscription);
+    let query = r#"{
+            __type(name: "_Entity") { possibleTypes { name } }
+        }"#;
+    assert_eq!(
+        schema.execute(query).await.into_result().unwrap().data,
+        value!({
+            "__type": {
+                "possibleTypes": [
+                    {"name": "MyObj"},
+                ]
+            }
+        })
     );
 }

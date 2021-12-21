@@ -25,7 +25,7 @@ async fn quickstart() -> Result<()> {
         let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription).finish();
 
         let mut app = tide::new();
-        let endpoint = async_graphql_tide::endpoint(schema);
+        let endpoint = async_graphql_tide::graphql(schema);
         app.at("/").post(endpoint.clone()).get(endpoint);
         app.listen(listen_addr).await
     });
@@ -184,7 +184,7 @@ async fn upload() -> Result<()> {
         let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription).finish();
 
         let mut app = tide::new();
-        app.at("/").post(async_graphql_tide::endpoint(schema));
+        app.at("/").post(async_graphql_tide::graphql(schema));
         app.listen(listen_addr).await
     });
 

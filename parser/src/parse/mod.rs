@@ -150,7 +150,11 @@ fn parse_number(pair: Pair<Rule>, pc: &mut PositionCalculator) -> Result<Positio
     debug_assert_eq!(pair.as_rule(), Rule::number);
     let pos = pc.step(&pair);
     Ok(Positioned::new(
-        pair.as_str().parse().expect("failed to parse number"),
+        pair.as_str().parse().map_err(|err| Error::Syntax {
+            message: format!("invalid number: {}", err),
+            start: pos,
+            end: None,
+        })?,
         pos,
     ))
 }
@@ -311,4 +315,22 @@ fn parse_arguments(
 fn parse_name(pair: Pair<Rule>, pc: &mut PositionCalculator) -> Result<Positioned<Name>> {
     debug_assert_eq!(pair.as_rule(), Rule::name);
     Ok(Positioned::new(Name::new(pair.as_str()), pc.step(&pair)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_number_lookahead_restrictions() {
+        GraphQLParser::parse(Rule::const_list, "[123 abc]").unwrap();
+        GraphQLParser::parse(Rule::const_list, "[123.0123 abc]").unwrap();
+        GraphQLParser::parse(Rule::const_list, "[123.0123e7 abc]").unwrap();
+        GraphQLParser::parse(Rule::const_list, "[123.0123e77 abc]").unwrap();
+
+        assert!(GraphQLParser::parse(Rule::const_list, "[123abc]").is_err());
+        assert!(GraphQLParser::parse(Rule::const_list, "[123.0123abc]").is_err());
+        assert!(GraphQLParser::parse(Rule::const_list, "[123.0123e7abc]").is_err());
+        assert!(GraphQLParser::parse(Rule::const_list, "[123.0123e77abc]").is_err());
+    }
 }

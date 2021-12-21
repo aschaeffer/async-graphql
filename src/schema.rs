@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -6,18 +7,19 @@ use futures_util::stream::{self, Stream, StreamExt};
 use indexmap::map::IndexMap;
 
 use crate::context::{Data, QueryEnvInner};
+use crate::custom_directive::CustomDirectiveFactory;
 use crate::extensions::{ExtensionFactory, Extensions};
 use crate::model::__DirectiveLocation;
-use crate::parser::parse_query;
-use crate::parser::types::{DocumentOperations, OperationType};
+use crate::parser::types::{Directive, DocumentOperations, OperationType, Selection, SelectionSet};
+use crate::parser::{parse_query, Positioned};
 use crate::registry::{MetaDirective, MetaInputValue, Registry};
 use crate::resolver_utils::{resolve_container, resolve_container_serial};
 use crate::subscription::collect_subscription_streams;
 use crate::types::QueryRoot;
 use crate::validation::{check_rules, ValidationMode};
 use crate::{
-    BatchRequest, BatchResponse, CacheControl, ContextBase, ObjectType, QueryEnv, Request,
-    Response, ServerError, SubscriptionType, Type, ID,
+    BatchRequest, BatchResponse, CacheControl, ContextBase, InputType, ObjectType, OutputType,
+    QueryEnv, Request, Response, ServerError, SubscriptionType, Variables, ID,
 };
 
 /// Schema builder
@@ -31,13 +33,22 @@ pub struct SchemaBuilder<Query, Mutation, Subscription> {
     complexity: Option<usize>,
     depth: Option<usize>,
     extensions: Vec<Box<dyn ExtensionFactory>>,
+    custom_directives: HashMap<&'static str, Box<dyn CustomDirectiveFactory>>,
 }
 
 impl<Query, Mutation, Subscription> SchemaBuilder<Query, Mutation, Subscription> {
-    /// Manually register a type in the schema.
+    /// Manually register a input type in the schema.
     ///
     /// You can use this function to register schema types that are not directly referenced.
-    pub fn register_type<T: Type>(mut self) -> Self {
+    pub fn register_input_type<T: InputType>(mut self) -> Self {
+        T::create_type_info(&mut self.registry);
+        self
+    }
+
+    /// Manually register a output type in the schema.
+    ///
+    /// You can use this function to register schema types that are not directly referenced.
+    pub fn register_output_type<T: OutputType>(mut self) -> Self {
         T::create_type_info(&mut self.registry);
         self
     }
@@ -111,9 +122,36 @@ impl<Query, Mutation, Subscription> SchemaBuilder<Query, Mutation, Subscription>
         self
     }
 
-    /// Override the name of the specified type.
-    pub fn override_description<T: Type>(mut self, desc: &'static str) -> Self {
-        self.registry.set_description::<T>(desc);
+    /// Override the name of the specified input type.
+    pub fn override_input_type_description<T: InputType>(mut self, desc: &'static str) -> Self {
+        self.registry.set_description(&*T::type_name(), desc);
+        self
+    }
+
+    /// Override the name of the specified output type.
+    pub fn override_output_type_description<T: OutputType>(mut self, desc: &'static str) -> Self {
+        self.registry.set_description(&*T::type_name(), desc);
+        self
+    }
+
+    /// Register a custom directive.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the directive with the same name is already registered.
+    pub fn directive<T: CustomDirectiveFactory>(mut self, directive: T) -> Self {
+        let name = directive.name();
+        let instance = Box::new(directive);
+
+        instance.register(&mut self.registry);
+
+        if name == "skip"
+            || name == "include"
+            || self.custom_directives.insert(name, instance).is_some()
+        {
+            panic!("Directive `{}` already exists", name);
+        }
+
         self
     }
 
@@ -135,6 +173,7 @@ impl<Query, Mutation, Subscription> SchemaBuilder<Query, Mutation, Subscription>
             env: SchemaEnv(Arc::new(SchemaEnvInner {
                 registry: self.registry,
                 data: self.data,
+                custom_directives: self.custom_directives,
             })),
         }))
     }
@@ -144,6 +183,7 @@ impl<Query, Mutation, Subscription> SchemaBuilder<Query, Mutation, Subscription>
 pub struct SchemaEnvInner {
     pub registry: Registry,
     pub data: Data,
+    pub custom_directives: HashMap<&'static str, Box<dyn CustomDirectiveFactory>>,
 }
 
 #[doc(hidden)]
@@ -230,6 +270,7 @@ where
             complexity: None,
             depth: None,
             extensions: Default::default(),
+            custom_directives: Default::default(),
         }
     }
 
@@ -269,12 +310,13 @@ where
                     description: Some("Included when true."),
                     ty: "Boolean!".to_string(),
                     default_value: None,
-                    validator: None,
                     visible: None,
                     is_secret: false,
                 });
                 args
-            }
+            },
+            is_repeatable: false,
+            visible: None,
         });
 
         registry.add_directive(MetaDirective {
@@ -292,27 +334,21 @@ where
                     description: Some("Skipped when true."),
                     ty: "Boolean!".to_string(),
                     default_value: None,
-                    validator: None,
                     visible: None,
                     is_secret: false,
                 });
                 args
-            }
-        });
-
-        registry.add_directive(MetaDirective {
-            name: "ifdef",
-            description: Some("Directs the executor to query only when the field exists."),
-            locations: vec![__DirectiveLocation::FIELD],
-            args: Default::default(),
+            },
+            is_repeatable: false,
+            visible: None,
         });
 
         // register scalars
-        bool::create_type_info(&mut registry);
-        i32::create_type_info(&mut registry);
-        f32::create_type_info(&mut registry);
-        String::create_type_info(&mut registry);
-        ID::create_type_info(&mut registry);
+        <bool as InputType>::create_type_info(&mut registry);
+        <i32 as InputType>::create_type_info(&mut registry);
+        <f32 as InputType>::create_type_info(&mut registry);
+        <String as InputType>::create_type_info(&mut registry);
+        <ID as InputType>::create_type_info(&mut registry);
 
         QueryRoot::<Query>::create_type_info(&mut registry);
         if !Mutation::is_empty() {
@@ -379,7 +415,7 @@ where
         extensions.attach_query_data(query_data.clone());
 
         let request = extensions.prepare_request(request).await?;
-        let document = {
+        let mut document = {
             let query = &request.query;
             let fut_parse = async { parse_query(&query).map_err(Into::<ServerError>::into) };
             futures_util::pin_mut!(fut_parse);
@@ -442,7 +478,13 @@ where
             }
         };
 
-        let (operation_name, operation) = operation.map_err(|err| vec![err])?;
+        let (operation_name, mut operation) = operation.map_err(|err| vec![err])?;
+
+        // remove skipped fields
+        for fragment in document.fragments.values_mut() {
+            remove_skipped_selection(&mut fragment.node.selection_set.node, &request.variables);
+        }
+        remove_skipped_selection(&mut operation.node.selection_set.node, &request.variables);
 
         let env = QueryEnvInner {
             extensions,
@@ -585,5 +627,53 @@ where
         request: impl Into<Request>,
     ) -> impl Stream<Item = Response> + Send + Unpin {
         self.execute_stream_with_session_data(request.into(), Default::default())
+    }
+}
+
+fn remove_skipped_selection(selection_set: &mut SelectionSet, variables: &Variables) {
+    fn is_skipped(directives: &[Positioned<Directive>], variables: &Variables) -> bool {
+        for directive in directives {
+            let include = match &*directive.node.name.node {
+                "skip" => false,
+                "include" => true,
+                _ => continue,
+            };
+
+            if let Some(condition_input) = directive.node.get_argument("if") {
+                let value = condition_input
+                    .node
+                    .clone()
+                    .into_const_with(|name| variables.get(&name).cloned().ok_or(()))
+                    .unwrap_or_default();
+                let value: bool = InputType::parse(Some(value)).unwrap_or_default();
+                if include != value {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    selection_set
+        .items
+        .retain(|selection| !is_skipped(selection.node.directives(), variables));
+
+    for selection in &mut selection_set.items {
+        selection.node.directives_mut().retain(|directive| {
+            directive.node.name.node != "skip" && directive.node.name.node != "include"
+        });
+    }
+
+    for selection in &mut selection_set.items {
+        match &mut selection.node {
+            Selection::Field(field) => {
+                remove_skipped_selection(&mut field.node.selection_set.node, variables);
+            }
+            Selection::FragmentSpread(_) => {}
+            Selection::InlineFragment(inline_fragment) => {
+                remove_skipped_selection(&mut inline_fragment.node.selection_set.node, variables);
+            }
+        }
     }
 }

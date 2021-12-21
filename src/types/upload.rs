@@ -5,7 +5,7 @@ use std::io::Read;
 #[cfg(feature = "unblock")]
 use futures_util::io::AsyncRead;
 
-use crate::{registry, Context, InputType, InputValueError, InputValueResult, Type, Value};
+use crate::{registry, Context, InputType, InputValueError, InputValueResult, Value};
 
 /// A file upload value.
 pub struct UploadValue {
@@ -68,10 +68,10 @@ impl UploadValue {
 /// ```
 /// use async_graphql::*;
 ///
-/// struct MutationRoot;
+/// struct Mutation;
 ///
 /// #[Object]
-/// impl MutationRoot {
+/// impl Mutation {
 ///     async fn upload(&self, ctx: &Context<'_>, file: Upload) -> bool {
 ///         println!("upload: filename={}", file.value(ctx).unwrap().filename);
 ///         true
@@ -80,7 +80,8 @@ impl UploadValue {
 ///
 /// ```
 /// # Example Curl Request
-/// Assuming you have defined your MutationRoot like in the example above,
+///
+/// Assuming you have defined your Mutation like in the example above,
 /// you can now upload a file `myFile.txt` with the below curl command:
 ///
 /// ```curl
@@ -100,22 +101,23 @@ impl Upload {
     }
 }
 
-impl Type for Upload {
+impl InputType for Upload {
+    type RawValueType = Self;
+
     fn type_name() -> Cow<'static, str> {
         Cow::Borrowed("Upload")
     }
 
     fn create_type_info(registry: &mut registry::Registry) -> String {
-        registry.create_type::<Self, _>(|_| registry::MetaType::Scalar {
+        registry.create_input_type::<Self, _>(|_| registry::MetaType::Scalar {
             name: Self::type_name().to_string(),
             description: None,
             is_valid: |value| matches!(value, Value::String(_)),
             visible: None,
+            specified_by_url: Some("https://github.com/jaydenseric/graphql-multipart-request-spec"),
         })
     }
-}
 
-impl InputType for Upload {
     fn parse(value: Option<Value>) -> InputValueResult<Self> {
         const PREFIX: &str = "#__graphql_file__:";
         let value = value.unwrap_or_default();
@@ -129,5 +131,9 @@ impl InputType for Upload {
 
     fn to_value(&self) -> Value {
         Value::Null
+    }
+
+    fn as_raw_value(&self) -> Option<&Self::RawValueType> {
+        Some(self)
     }
 }

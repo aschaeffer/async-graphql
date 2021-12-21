@@ -1,12 +1,13 @@
 use indexmap::map::IndexMap;
 
+use async_graphql_value::Value;
+
 use crate::context::QueryPathNode;
 use crate::parser::types::{Directive, Field};
 use crate::registry::MetaInputValue;
 use crate::validation::utils::is_valid_input_value;
 use crate::validation::visitor::{Visitor, VisitorContext};
 use crate::{Name, Positioned, QueryPathSegment};
-use async_graphql_value::Value;
 
 #[derive(Default)]
 pub struct ArgumentsOfCorrectType<'a> {
@@ -55,20 +56,7 @@ impl<'a> Visitor<'a> for ArgumentsOfCorrectType<'a> {
                 })
                 .ok();
 
-            if let Some(validator) = &arg.validator {
-                if let Some(value) = &value {
-                    if let Err(e) = validator.is_valid_with_extensions(value) {
-                        ctx.report_error_with_extensions(
-                            vec![name.pos],
-                            format!("Invalid value for argument \"{}\", {}", arg.name, e.message),
-                            e.extensions,
-                        );
-                        return;
-                    }
-                }
-            }
-
-            if let Some(e) = value.and_then(|value| {
+            if let Some(reason) = value.and_then(|value| {
                 is_valid_input_value(
                     ctx.registry,
                     &arg.ty,
@@ -79,10 +67,9 @@ impl<'a> Visitor<'a> for ArgumentsOfCorrectType<'a> {
                     },
                 )
             }) {
-                ctx.report_error_with_extensions(
+                ctx.report_error(
                     vec![name.pos],
-                    format!("Invalid value for argument {}", e.message),
-                    e.extensions,
+                    format!("Invalid value for argument {}", reason),
                 );
             }
         }

@@ -1,9 +1,8 @@
-use std::convert::TryFrom;
-
-use axum::body::Body;
+use axum::body::{boxed, Body, BoxBody};
+use axum::http;
+use axum::http::header::HeaderName;
+use axum::http::{HeaderValue, Response};
 use axum::response::IntoResponse;
-use headers::HeaderName;
-use http::{HeaderValue, Response};
 
 /// Responder for a GraphQL response.
 ///
@@ -24,11 +23,9 @@ impl From<async_graphql::BatchResponse> for GraphQLResponse {
 }
 
 impl IntoResponse for GraphQLResponse {
-    type Body = Body;
-    type BodyError = <Self::Body as axum::body::HttpBody>::Error;
-
-    fn into_response(self) -> Response<Body> {
-        let mut resp = Response::new(serde_json::to_string(&self.0).unwrap().into());
+    fn into_response(self) -> Response<BoxBody> {
+        let body: Body = serde_json::to_string(&self.0).unwrap().into();
+        let mut resp = Response::new(boxed(body));
         resp.headers_mut().insert(
             http::header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),

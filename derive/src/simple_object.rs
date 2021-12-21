@@ -1,13 +1,27 @@
 use darling::ast::Data;
 use proc_macro::TokenStream;
 use quote::quote;
+use std::str::FromStr;
 use syn::ext::IdentExt;
-use syn::Error;
+use syn::{Error, Ident, Path, Type};
 
-use crate::args::{self, RenameRuleExt, RenameTarget};
+use crate::args::{self, RenameRuleExt, RenameTarget, SimpleObjectField};
 use crate::utils::{
     gen_deprecation, generate_guards, get_crate_name, get_rustdoc, visible_fn, GeneratorResult,
 };
+
+#[derive(Debug)]
+struct DerivedFieldMetadata {
+    ident: Ident,
+    into: Type,
+    owned: Option<bool>,
+    with: Option<Path>,
+}
+
+struct SimpleObjectFieldGenerator<'a> {
+    field: &'a SimpleObjectField,
+    derived: Option<DerivedFieldMetadata>,
+}
 
 pub fn generate(object_args: &args::SimpleObject) -> GeneratorResult<TokenStream> {
     let crate_name = get_crate_name(object_args.internal);
@@ -37,13 +51,60 @@ pub fn generate(object_args: &args::SimpleObject) -> GeneratorResult<TokenStream
     let mut resolvers = Vec::new();
     let mut schema_fields = Vec::new();
 
+    let mut processed_fields: Vec<SimpleObjectFieldGenerator> = vec![];
+
+    // Before processing the fields, we generate the derivated fields
     for field in &s.fields {
+        processed_fields.push(SimpleObjectFieldGenerator {
+            field,
+            derived: None,
+        });
+
+        for derived in &field.derived {
+            if derived.name.is_some() && derived.into.is_some() {
+                let name = derived.name.clone().unwrap();
+                let into = match syn::parse2::<Type>(
+                    proc_macro2::TokenStream::from_str(&derived.into.clone().unwrap()).unwrap(),
+                ) {
+                    Ok(e) => e,
+                    _ => {
+                        return Err(Error::new_spanned(
+                            &name,
+                            "derived into must be a valid type.",
+                        )
+                        .into());
+                    }
+                };
+
+                let derived = DerivedFieldMetadata {
+                    ident: name,
+                    into,
+                    owned: derived.owned,
+                    with: derived.with.clone(),
+                };
+
+                processed_fields.push(SimpleObjectFieldGenerator {
+                    field,
+                    derived: Some(derived),
+                })
+            }
+        }
+    }
+
+    for SimpleObjectFieldGenerator { field, derived } in &processed_fields {
         if field.skip {
             continue;
         }
-        let ident = match &field.ident {
+
+        let base_ident = match &field.ident {
             Some(ident) => ident,
             None => return Err(Error::new_spanned(&ident, "All fields must be named.").into()),
+        };
+
+        let ident = if let Some(derived) = derived {
+            &derived.ident
+        } else {
+            base_ident
         };
 
         let field_name = field.name.clone().unwrap_or_else(|| {
@@ -65,7 +126,18 @@ pub fn generate(object_args: &args::SimpleObject) -> GeneratorResult<TokenStream
             None => quote! { ::std::option::Option::None },
         };
         let vis = &field.vis;
-        let ty = &field.ty;
+
+        let ty = if let Some(derived) = derived {
+            &derived.into
+        } else {
+            &field.ty
+        };
+
+        let owned = if let Some(derived) = derived {
+            derived.owned.unwrap_or(field.owned)
+        } else {
+            field.owned
+        };
 
         let cache_control = {
             let public = field.cache_control.is_public();
@@ -85,7 +157,7 @@ pub fn generate(object_args: &args::SimpleObject) -> GeneratorResult<TokenStream
                 name: ::std::borrow::ToOwned::to_owned(#field_name),
                 description: #field_desc,
                 args: ::std::default::Default::default(),
-                ty: <#ty as #crate_name::Type>::create_type_info(registry),
+                ty: <#ty as #crate_name::OutputType>::create_type_info(registry),
                 deprecation: #field_deprecation,
                 cache_control: #cache_control,
                 external: #external,
@@ -96,31 +168,49 @@ pub fn generate(object_args: &args::SimpleObject) -> GeneratorResult<TokenStream
             });
         });
 
+        let guard_map_err = quote! {
+            .map_err(|err| err.into_server_error(ctx.item.pos))
+        };
         let guard = match &field.guard {
-            Some(meta) => generate_guards(&crate_name, meta)?,
+            Some(code) => Some(generate_guards(&crate_name, code, guard_map_err)?),
             None => None,
         };
-        let guard = guard.map(
-            |guard| quote! { #guard.check(ctx).await.map_err(|err| err.into_server_error(ctx.item.pos))?; },
-        );
 
-        getters.push(if !field.owned {
+        let with_function = derived.as_ref().and_then(|x| x.with.as_ref());
+
+        let mut block = match !owned {
+            true => quote! {
+                &self.#base_ident
+            },
+            false => quote! {
+                ::std::clone::Clone::clone(&self.#base_ident)
+            },
+        };
+
+        block = match (derived, with_function) {
+            (Some(_), Some(with)) => quote! {
+                #with(#block)
+            },
+            (Some(_), None) => quote! {
+                ::std::convert::Into::into(#block)
+            },
+            (_, _) => block,
+        };
+
+        let ty = match !owned {
+            true => quote! { &#ty },
+            false => quote! { #ty },
+        };
+
+        getters.push(
             quote! {
                  #[inline]
                  #[allow(missing_docs)]
-                 #vis async fn #ident(&self, ctx: &#crate_name::Context<'_>) -> #crate_name::Result<&#ty> {
-                     ::std::result::Result::Ok(&self.#ident)
+                 #vis async fn #ident(&self, ctx: &#crate_name::Context<'_>) -> #crate_name::Result<#ty> {
+                     ::std::result::Result::Ok(#block)
                  }
             }
-        } else {
-            quote! {
-                #[inline]
-                #[allow(missing_docs)]
-                #vis async fn #ident(&self, ctx: &#crate_name::Context<'_>) -> #crate_name::Result<#ty> {
-                    ::std::result::Result::Ok(::std::clone::Clone::clone(&self.#ident))
-                }
-            }
-        });
+        );
 
         resolvers.push(quote! {
             if ctx.item.node.name.node == #field_name {
@@ -135,7 +225,7 @@ pub fn generate(object_args: &args::SimpleObject) -> GeneratorResult<TokenStream
         });
     }
 
-    if !object_args.dummy && resolvers.is_empty() {
+    if !object_args.fake && resolvers.is_empty() {
         return Err(Error::new_spanned(
             &ident,
             "A GraphQL Object type must define one or more fields.",
@@ -184,30 +274,6 @@ pub fn generate(object_args: &args::SimpleObject) -> GeneratorResult<TokenStream
             }
 
             #[allow(clippy::all, clippy::pedantic)]
-            impl #impl_generics #crate_name::Type for #ident #ty_generics #where_clause {
-                fn type_name() -> ::std::borrow::Cow<'static, ::std::primitive::str> {
-                    ::std::borrow::Cow::Borrowed(#gql_typename)
-                }
-
-                fn create_type_info(registry: &mut #crate_name::registry::Registry) -> ::std::string::String {
-                    registry.create_type::<Self, _>(|registry| #crate_name::registry::MetaType::Object {
-                        name: ::std::borrow::ToOwned::to_owned(#gql_typename),
-                        description: #desc,
-                        fields: {
-                            let mut fields = #crate_name::indexmap::IndexMap::new();
-                            #(#schema_fields)*
-                            #concat_complex_fields
-                            fields
-                        },
-                        cache_control: #cache_control,
-                        extends: #extends,
-                        keys: ::std::option::Option::None,
-                        visible: #visible,
-                    })
-                }
-            }
-
-            #[allow(clippy::all, clippy::pedantic)]
             #[#crate_name::async_trait::async_trait]
 
             impl #impl_generics #crate_name::resolver_utils::ContainerType for #ident #ty_generics #where_clause {
@@ -221,6 +287,29 @@ pub fn generate(object_args: &args::SimpleObject) -> GeneratorResult<TokenStream
             #[allow(clippy::all, clippy::pedantic)]
             #[#crate_name::async_trait::async_trait]
             impl #impl_generics #crate_name::OutputType for #ident #ty_generics #where_clause {
+                fn type_name() -> ::std::borrow::Cow<'static, ::std::primitive::str> {
+                    ::std::borrow::Cow::Borrowed(#gql_typename)
+                }
+
+                fn create_type_info(registry: &mut #crate_name::registry::Registry) -> ::std::string::String {
+                    registry.create_output_type::<Self, _>(|registry| #crate_name::registry::MetaType::Object {
+                        name: ::std::borrow::ToOwned::to_owned(#gql_typename),
+                        description: #desc,
+                        fields: {
+                            let mut fields = #crate_name::indexmap::IndexMap::new();
+                            #(#schema_fields)*
+                            #concat_complex_fields
+                            fields
+                        },
+                        cache_control: #cache_control,
+                        extends: #extends,
+                        keys: ::std::option::Option::None,
+                        visible: #visible,
+                        is_subscription: false,
+                        rust_typename: ::std::any::type_name::<Self>(),
+                    })
+                }
+
                 async fn resolve(&self, ctx: &#crate_name::ContextSelectionSet<'_>, _field: &#crate_name::Positioned<#crate_name::parser::types::Field>) -> #crate_name::ServerResult<#crate_name::Value> {
                     #resolve_container
                 }
@@ -240,7 +329,7 @@ pub fn generate(object_args: &args::SimpleObject) -> GeneratorResult<TokenStream
                     name: &str,
                     complex_fields: #crate_name::indexmap::IndexMap<::std::string::String, #crate_name::registry::MetaField>,
                 ) -> ::std::string::String where Self: #crate_name::OutputType {
-                    registry.create_type::<Self, _>(|registry| #crate_name::registry::MetaType::Object {
+                    registry.create_output_type::<Self, _>(|registry| #crate_name::registry::MetaType::Object {
                         name: ::std::borrow::ToOwned::to_owned(name),
                         description: #desc,
                         fields: {
@@ -253,6 +342,8 @@ pub fn generate(object_args: &args::SimpleObject) -> GeneratorResult<TokenStream
                         extends: #extends,
                         keys: ::std::option::Option::None,
                         visible: #visible,
+                        is_subscription: false,
+                        rust_typename: ::std::any::type_name::<Self>(),
                     })
                 }
 
@@ -270,19 +361,6 @@ pub fn generate(object_args: &args::SimpleObject) -> GeneratorResult<TokenStream
 
             let expanded = quote! {
                 #[allow(clippy::all, clippy::pedantic)]
-                impl #crate_name::Type for #concrete_type {
-                    fn type_name() -> ::std::borrow::Cow<'static, ::std::primitive::str> {
-                        ::std::borrow::Cow::Borrowed(#gql_typename)
-                    }
-
-                    fn create_type_info(registry: &mut #crate_name::registry::Registry) -> ::std::string::String {
-                        let mut fields = #crate_name::indexmap::IndexMap::new();
-                        #concat_complex_fields
-                        Self::__internal_create_type_info(registry, #gql_typename, fields)
-                    }
-                }
-
-                #[allow(clippy::all, clippy::pedantic)]
                 #[#crate_name::async_trait::async_trait]
                 impl #crate_name::resolver_utils::ContainerType for #concrete_type {
                     async fn resolve_field(&self, ctx: &#crate_name::Context<'_>) -> #crate_name::ServerResult<::std::option::Option<#crate_name::Value>> {
@@ -294,6 +372,16 @@ pub fn generate(object_args: &args::SimpleObject) -> GeneratorResult<TokenStream
                 #[allow(clippy::all, clippy::pedantic)]
                 #[#crate_name::async_trait::async_trait]
                 impl #crate_name::OutputType for #concrete_type {
+                    fn type_name() -> ::std::borrow::Cow<'static, ::std::primitive::str> {
+                        ::std::borrow::Cow::Borrowed(#gql_typename)
+                    }
+
+                    fn create_type_info(registry: &mut #crate_name::registry::Registry) -> ::std::string::String {
+                        let mut fields = #crate_name::indexmap::IndexMap::new();
+                        #concat_complex_fields
+                        Self::__internal_create_type_info(registry, #gql_typename, fields)
+                    }
+
                     async fn resolve(&self, ctx: &#crate_name::ContextSelectionSet<'_>, _field: &#crate_name::Positioned<#crate_name::parser::types::Field>) -> #crate_name::ServerResult<#crate_name::Value> {
                         #resolve_container
                     }

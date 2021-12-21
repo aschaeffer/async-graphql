@@ -33,9 +33,9 @@ use crate::{Response, ServerError, ServerResult, ValidationResult, Value, Variab
 ///     .extension(Tracing)
 ///     .finish();
 ///
-/// tokio::runtime::Runtime::new().unwrap().block_on(async {
-///     schema.execute(Request::new("{ value }")).await;
-/// });
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// schema.execute(Request::new("{ value }")).await;
+/// # });
 /// ```
 #[cfg_attr(docsrs, doc(cfg(feature = "tracing")))]
 pub struct Tracing;
@@ -143,7 +143,9 @@ impl Extension for TracingExtension {
         );
         next.run(ctx, info)
             .map_err(|err| {
-                tracinglib::error!(target: "async_graphql::graphql", error = %err.message);
+                tracinglib::info!(target: "async_graphql::graphql",
+                                  error = %err.message,
+                                  "error");
                 err
             })
             .instrument(span)

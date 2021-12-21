@@ -4,6 +4,7 @@
 
 use once_cell::sync::Lazy;
 
+use crate::futures_util::Stream;
 use crate::parser::types::ExecutableDocument;
 use crate::validation::visitor::{visit, RuleError, Visitor, VisitorContext};
 use crate::*;
@@ -287,10 +288,10 @@ impl ComplicatedArgs {
     }
 }
 
-pub struct QueryRoot;
+pub struct Query;
 
 #[Object(internal)]
-impl QueryRoot {
+impl Query {
     async fn human(&self, id: Option<ID>) -> Option<Human> {
         unimplemented!()
     }
@@ -336,17 +337,26 @@ impl QueryRoot {
     }
 }
 
-pub struct MutationRoot;
+pub struct Mutation;
 
 #[Object(internal)]
-impl MutationRoot {
+impl Mutation {
     async fn test_input(&self, #[graphql(default)] input: TestInput) -> i32 {
         unimplemented!()
     }
 }
 
-static TEST_HARNESS: Lazy<Schema<QueryRoot, MutationRoot, EmptySubscription>> =
-    Lazy::new(|| Schema::new(QueryRoot, MutationRoot, EmptySubscription));
+pub struct Subscription;
+
+#[Subscription(internal)]
+impl Subscription {
+    async fn values(&self) -> impl Stream<Item = i32> {
+        futures_util::stream::once(async move { 10 })
+    }
+}
+
+static TEST_HARNESS: Lazy<Schema<Query, Mutation, Subscription>> =
+    Lazy::new(|| Schema::new(Query, Mutation, Subscription));
 
 pub(crate) fn validate<'a, V, F>(
     doc: &'a ExecutableDocument,
